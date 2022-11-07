@@ -1,0 +1,250 @@
+#! /usr/bin/env python
+
+# SPDX-FileCopyrightText: 2022 Marcel Bargull
+#
+# SPDX-License-Identifier: ISC
+
+
+# Usage example for the current (2022-11-07) Python 3.11 migration to save a
+# full log of recognized missing packages/feedstocks and print out the ones
+# that received the migration YAML but have (presumably) missing builds:
+#   migration-match-check \
+#     --old='python 3.10.*' --new='python 3.11.*' --migration-yaml='python311.yaml' |
+#     tee python311.yaml.full.log |
+#     grep -F python311.yaml:
+
+
+from argparse import ArgumentParser
+from io import BytesIO
+from itertools import count
+from json import load as json_load
+from pathlib import Path
+from sys import argv
+from tarfile import open as tarfile_open
+import logging
+
+
+# prevent conda logging setup to takeover requests/urllib3 loggers...
+import conda.gateways.logging
+
+conda.gateways.logging.initialize_logging = lambda: None
+
+from conda.exports import get_index, MatchSpec, PackageRecord, VersionOrder
+from requests import get as requests_get
+
+logging.getLogger("conda.models.version").setLevel(logging.ERROR)
+logger = logging.getLogger(__name__)
+info = logger.info
+
+# FIXME: This can show false positives if packages have been converted from noarch to
+#        platform-specifc but are not built for all platforms.
+
+
+def get_archived_feedstocks():
+    names = set()
+    # NOTE: Got some strange results via pygithub and github3.py...
+    #       Works when doing the requests manually, though.
+    per_page = 100
+    base_url = "https://api.github.com/search/repositories"
+    params = ["per_page=100", "q=-feedstock+in:name+org:conda-forge+archived:true"]
+    for page in count(1):
+        url = base_url + "?" + "&".join(params + [f"page={page}"])
+        info("Getting %s", url)
+        res = requests_get(f"{url}", headers={"Accept": "application/vnd.github+json"})
+        content = res.json()
+        try:
+            repos = content["items"]
+        except KeyError:
+            logger.error("content: %s", repos)
+            raise
+        names.update(repo["name"].removesuffix("-feedstock") for repo in repos)
+        if len(repos) < per_page:
+            break
+    return names
+
+
+def get_feedstock_outputs():
+    feedstock_outputs = {}
+    # Read the name->feedstocks mapping from tar archive because faster and no API limits.
+    outputs_url = (
+        "https://github.com/conda-forge/feedstock-outputs/archive/refs/heads/main.tar.gz"
+    )
+    info("Reading from %s", outputs_url)
+    with tarfile_open(mode="r|gz", fileobj=BytesIO(requests_get(outputs_url).content)) as tar:
+        for tarinfo in tar:
+            if not tarinfo.isfile():
+                continue
+            path = Path(tarinfo.name)
+            if not path.suffix == ".json":
+                continue
+            with tar.extractfile(tarinfo) as json_file:
+                feedstock_outputs[path.stem] = json_load(json_file)["feedstocks"]
+    info("Got %d name->feedstocks mappings", len(feedstock_outputs))
+    return feedstock_outputs
+
+
+def has_migration_yaml(file_name, feedstock):
+    org_url = "https://raw.githubusercontent.com/conda-forge"
+    # NOTE: This only looks at the main branch. (Checking at other branches wouldn't fix
+    #       everything either way since we only look at package names.)
+    res = requests_get(
+        f"{org_url}/{feedstock}-feedstock/main/.ci_support/migrations/{file_name}"
+    )
+    return res.status_code
+
+
+def get_matching_packages(index, match_record):
+    index_size = len(index)
+    log_every = 100_000
+    matching_package_names = set()
+    for i, record in enumerate(index.values(), 1):
+        is_match = False
+        for dep in map(MatchSpec, record.depends):
+            if dep.name == match_record.name:
+                if not dep.match(match_record):
+                    is_match = False
+                    break
+                is_match = True
+        if is_match:
+            matching_package_names.add(record.name)
+        if i == index_size or i % log_every == 0:
+            info(
+                "Scanned %d / %d records. Found %d matches for %s",
+                i,
+                index_size,
+                len(matching_package_names),
+                match_record,
+            )
+    return matching_package_names
+
+
+def get_newest_build(index, match_spec):
+    name = match_spec.name
+    records = (rec for rec in index.values() if rec.name == name)
+    matching_records = (rec for rec in records if match_spec.match(rec))
+    build = max(
+        matching_records,
+        default=None,
+        key=lambda rec: (VersionOrder(rec.version), rec.build_number),
+    )
+    if not build:
+        raise KeyError(str(match_spec))
+    return build
+
+
+def get_match_spec(match_spec_str):
+    match_spec = MatchSpec(match_spec_str)
+    version = match_spec.version.spec_str
+    if version and not match_spec.get("build"):
+        if not set("<>*") & set(version):
+            logger.warn("Probably missing at .* at the end of version string %s", version)
+    return match_spec
+
+
+def run(old, new, platforms, check_archived, migration_yaml, print_feedstock):
+    if not platforms:
+        platforms = (
+            "osx-64",
+            "osx-arm64",
+            "linux-64",
+            "linux-aarch64",
+            "linux-ppc64le",
+            "win-64",
+        )
+    old_match_spec = get_match_spec(old)
+    new_match_spec = get_match_spec(new)
+    feedstock_outputs = {}
+    if check_archived or migration_yaml or print_feedstock:
+        feedstock_outputs = get_feedstock_outputs()
+    if check_archived:
+        archived_feedstocks = get_archived_feedstocks()
+
+    def p(indent, *args, **kwargs):
+        print(*(["  "] * indent), *args, **kwargs)
+
+    for platform in platforms:
+        info("Getting index for platform %s ...", platform)
+        index = get_index(
+            ["https://conda.anaconda.org/conda-forge"], prepend=False, platform=platform
+        )
+        info("Got index for platform %s with %d records", platform, len(index))
+
+        try:
+            old_record = get_newest_build(index, old_match_spec)
+            new_record = get_newest_build(index, new_match_spec)
+        except KeyError as e:
+            raise KeyError(f"No compatible build for platform {platform}: {e}") from e
+        missing_packages = sorted(
+            get_matching_packages(index, old_record) - get_matching_packages(index, new_record)
+        )
+        info("Got %d missing packages for platform %s", len(missing_packages), platform)
+
+        str_width_platform = max(map(len, platforms))
+        str_width_package_name = max(map(len, missing_packages))
+        migration_yaml_statuses = {}
+
+        def xxx(string, no_placeholder):
+            if no_placeholder:
+                return string
+            return " " * len(string)
+
+        for package_name in missing_packages:
+            package_info = [
+                platform.ljust(str_width_platform),
+                package_name.ljust(str_width_package_name),
+            ]
+            feedstocks = feedstock_outputs.get(package_name, [])
+            if not feedstocks:
+                print(*package_info)
+            for feedstock in feedstocks:
+                feedstock_info = []
+                if check_archived:
+                    feedstock_info.append(xxx("archived", feedstock in archived_feedstocks))
+                if migration_yaml:
+                    if feedstock not in migration_yaml_statuses:
+                        migration_yaml_statuses[feedstock] = has_migration_yaml(
+                            migration_yaml, feedstock
+                        )
+                    http_status = migration_yaml_statuses[feedstock]
+                    feedstock_info.append(
+                        xxx(f"{migration_yaml}:{http_status}", http_status != 404)
+                    )
+                feedstock_info.append(f"https://github.com/conda-forge/{feedstock}-feedstock")
+                print(*package_info, *feedstock_info)
+
+
+def get_argument_parser():
+    parser = ArgumentParser()
+    add = parser.add_argument
+    add("--old")
+    add("--new")
+    add("--platform", action="append", dest="platforms")
+    add(
+        "--print-feedstock",
+        choices=("yes", "no"),
+        type=lambda choice: choice == "yes",
+        default="yes",
+    )
+    add(
+        "--check-archived",
+        choices=("yes", "no"),
+        type=lambda choice: choice == "yes",
+        default="yes",
+    )
+    add("--migration-yaml")
+    add("--log-level", default="info")
+    return parser
+
+
+def main(args=None):
+    args = get_argument_parser().parse_args()
+    args_dict = args.__dict__.copy()
+    logging.basicConfig()
+    logging.getLogger().setLevel(args_dict.pop("log_level").upper())
+    return run(**args_dict)
+
+
+if __name__ == "__main__":
+    from sys import exit
+
+    exit(main())
